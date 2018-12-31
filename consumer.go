@@ -27,7 +27,7 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 	// new consumer with no-op checkpoint, counter, and logger
 	c := &Consumer{
 		streamName:               streamName,
-		initialShardIteratorType: "TRIM_HORIZON",
+		initialShardIteratorType: kinesis.ShardIteratorTypeTrimHorizon,
 		checkpoint:               &noopCheckpoint{},
 		counter:                  &noopCounter{},
 		logger: &noopLogger{
@@ -67,18 +67,13 @@ type Consumer struct {
 // returned from the AWS Kinesis library.
 //
 // If an error is returned, scanning stops. The sole exception is when the
-// function returns the special value SkipCheckpoint or StopScan.
+// function returns the special value SkipCheckpoint.
 type ScanFunc func(*Record) error
 
 // SkipCheckpoint is used as a return value from ScanFuncs to indicate that
 // the current checkpoint should be skipped skipped. It is not returned
 // as an error by any function.
 var SkipCheckpoint = errors.New("skip checkpoint")
-
-// StopScan is used as a return value from ScanFuncs to indicate that
-// the we should stop scanning the current shard. It is not returned
-// as an error by any function.
-var StopScan = errors.New("stop scan")
 
 // Scan launches a goroutine to process each of the shards in the stream. The ScanFunc
 // is passed through to each of the goroutines and called with each message pulled from
@@ -164,24 +159,26 @@ func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) e
 				continue
 			}
 
-			// call callback func with each record from response
+			// callback func with each record
 			for _, r := range resp.Records {
-				lastSeqNum = *r.SequenceNumber
-				c.counter.Add("records", 1)
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+					err := fn(r)
 
-				if err := fn(r); err != nil {
-					switch err {
-					case StopScan:
-						return nil
-					case SkipCheckpoint:
-						continue
-					default:
+					if err != nil && err != SkipCheckpoint {
 						return err
 					}
-				}
 
-				if err := c.checkpoint.Set(c.streamName, shardID, *r.SequenceNumber); err != nil {
-					return err
+					if err != SkipCheckpoint {
+						if err := c.checkpoint.Set(c.streamName, shardID, *r.SequenceNumber); err != nil {
+							return err
+						}
+					}
+
+					c.counter.Add("records", 1)
+					lastSeqNum = *r.SequenceNumber
 				}
 			}
 
@@ -208,29 +205,27 @@ func (c *Consumer) getShardIDs(streamName string) ([]string, error) {
 		return nil, fmt.Errorf("describe stream error: %v", err)
 	}
 
-	var ss []string
+	shardIDs := make([]string, len(resp.StreamDescription.Shards))
 	for _, shard := range resp.StreamDescription.Shards {
-		ss = append(ss, *shard.ShardId)
+		shardIDs = append(shardIDs, *shard.ShardId)
 	}
-	return ss, nil
+
+	return shardIDs, nil
 }
 
-func (c *Consumer) getShardIterator(streamName, shardID, lastSeqNum string) (*string, error) {
+func (c *Consumer) getShardIterator(streamName, shardID, seqNum string) (*string, error) {
 	params := &kinesis.GetShardIteratorInput{
 		ShardId:    aws.String(shardID),
 		StreamName: aws.String(streamName),
 	}
 
-	if lastSeqNum != "" {
-		params.ShardIteratorType = aws.String("AFTER_SEQUENCE_NUMBER")
-		params.StartingSequenceNumber = aws.String(lastSeqNum)
+	if seqNum != "" {
+		params.ShardIteratorType = aws.String(kinesis.ShardIteratorTypeAfterSequenceNumber)
+		params.StartingSequenceNumber = aws.String(seqNum)
 	} else {
 		params.ShardIteratorType = aws.String(c.initialShardIteratorType)
 	}
 
-	resp, err := c.client.GetShardIterator(params)
-	if err != nil {
-		return nil, err
-	}
-	return resp.ShardIterator, nil
+	res, err := c.client.GetShardIterator(params)
+	return res.ShardIterator, err
 }
