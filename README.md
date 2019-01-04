@@ -230,8 +230,8 @@ The package defaults to `ioutil.Discard` so swallow all logs. This can be custom
 
 ```go
 // logger
-log := &myLogger{
-	logger: log.New(os.Stdout, "consumer-example: ", log.LstdFlags)
+logger := &myLogger{
+	logger: log.New(os.Stdout, "consumer-example: ", log.LstdFlags),
 }
 
 // consumer

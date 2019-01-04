@@ -62,6 +62,11 @@ type ScanStatus struct {
 	SkipCheckpoint bool
 }
 
+// ScanFunc is the type of the function called for each message read
+// from the stream. The record argument contains the original record
+// returned from the AWS Kinesis library.
+type ScanFunc func(r *Record) ScanStatus
+
 // New creates a kinesis consumer with default settings. Use Option to override
 // any of the optional attributes.
 func New(streamName string, opts ...Option) (*Consumer, error) {
@@ -71,8 +76,11 @@ func New(streamName string, opts ...Option) (*Consumer, error) {
 
 	// new consumer with no-op checkpoint, counter, and logger
 	c := &Consumer{
+		shards:                   make(map[*string]*kinesis.Shard),
+		errc:                     make(chan error, 1),
+		wg:                       &sync.WaitGroup{},
 		streamName:               streamName,
-		initialShardIteratorType: "TRIM_HORIZON",
+		initialShardIteratorType: kinesis.ShardIteratorTypeTrimHorizon,
 		checkpoint:               &noopCheckpoint{},
 		counter:                  &noopCounter{},
 		logger: &noopLogger{
@@ -105,61 +113,89 @@ type Consumer struct {
 	logger                   Logger
 	checkpoint               Checkpoint
 	counter                  Counter
+	errc                     chan error
+	shards                   map[*string]*kinesis.Shard
+	mux                      sync.Mutex
+	wg                       *sync.WaitGroup
 }
 
 // Scan scans each of the shards of the stream, calls the callback
 // func with each of the kinesis records.
-func (c *Consumer) Scan(ctx context.Context, fn func(*Record) ScanStatus) error {
+func (c *Consumer) Scan(ctx context.Context, fn ScanFunc) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// get shard ids
-	shardIDs, err := c.getShardIDs(c.streamName)
+	if err := c.scanShards(ctx, fn); err != nil {
+		return err
+	}
+
+	go func() {
+		c.wg.Wait()
+		close(c.errc)
+	}()
+
+	for err := range c.errc {
+		return err
+	}
+	return nil
+}
+
+func (c *Consumer) addShard(shard *kinesis.Shard) {
+	c.mux.Lock()
+	c.shards[shard.ShardId] = shard
+	c.mux.Unlock()
+}
+
+func (c *Consumer) existingShard(shard *kinesis.Shard) bool {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	_, ok := c.shards[shard.ShardId]
+	return ok
+}
+
+func (c *Consumer) scanShards(ctx context.Context, fn ScanFunc) error {
+	// shard ids
+	shards, err := c.getShards(c.streamName)
 	if err != nil {
 		return fmt.Errorf("get shards error: %v", err)
 	}
 
-	if len(shardIDs) == 0 {
+	// shards available
+	if len(shards) == 0 {
 		return fmt.Errorf("no shards available")
 	}
 
-	var (
-		wg   sync.WaitGroup
-		errc = make(chan error, 1)
-	)
-	wg.Add(len(shardIDs))
-
 	// process each shard in a separate goroutine
-	for _, shardID := range shardIDs {
-		go func(shardID string) {
-			defer wg.Done()
+	for _, shard := range shards {
+		fmt.Println(c.shards)
+		if c.existingShard(shard) {
+			fmt.Println("existing shard", aws.StringValue(shard.ShardId))
+			continue
+		}
+		c.addShard(shard)
+		c.wg.Add(1)
 
-			if err := c.ScanShard(ctx, shardID, fn); err != nil {
+		go func(shardID string) {
+			defer c.wg.Done()
+
+			err := c.ScanShard(ctx, shardID, fn)
+			if err != nil {
 				select {
-				case errc <- fmt.Errorf("shard %s error: %v", shardID, err):
+				case c.errc <- fmt.Errorf("shard %s error: %v", shardID, err):
 					// first error to occur
 				default:
 					// error has already occured
 				}
 			}
-
-			cancel()
-		}(shardID)
+		}(aws.StringValue(shard.ShardId))
 	}
 
-	wg.Wait()
-	close(errc)
-
-	return <-errc
+	return nil
 }
 
 // ScanShard loops over records on a specific shard, calls the callback func
 // for each record and checkpoints the progress of scan.
-func (c *Consumer) ScanShard(
-	ctx context.Context,
-	shardID string,
-	fn func(*Record) ScanStatus,
-) error {
+func (c *Consumer) ScanShard(ctx context.Context, shardID string, fn ScanFunc) error {
 	// get checkpoint
 	lastSeqNum, err := c.checkpoint.Get(c.streamName, shardID)
 	if err != nil {
@@ -172,12 +208,11 @@ func (c *Consumer) ScanShard(
 		return fmt.Errorf("get shard iterator error: %v", err)
 	}
 
-	c.logger.Log("scanning", shardID, lastSeqNum)
+	c.logger.Log("starting scan", shardID, lastSeqNum)
+	defer func() {
+		c.logger.Log("stopping scan", shardID)
+	}()
 
-	return c.scanPagesOfShard(ctx, shardID, lastSeqNum, shardIterator, fn)
-}
-
-func (c *Consumer) scanPagesOfShard(ctx context.Context, shardID, lastSeqNum string, shardIterator *string, fn func(*Record) ScanStatus) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -208,7 +243,7 @@ func (c *Consumer) scanPagesOfShard(ctx context.Context, shardID, lastSeqNum str
 			}
 
 			if isShardClosed(resp.NextShardIterator, shardIterator) {
-				return nil
+				return c.scanShards(ctx, fn)
 			}
 			shardIterator = resp.NextShardIterator
 		}
@@ -219,7 +254,7 @@ func isShardClosed(nextShardIterator, currentShardIterator *string) bool {
 	return nextShardIterator == nil || currentShardIterator == nextShardIterator
 }
 
-func (c *Consumer) handleRecord(shardID string, r *Record, fn func(*Record) ScanStatus) (isScanStopped bool, err error) {
+func (c *Consumer) handleRecord(shardID string, r *Record, fn ScanFunc) (isScanStopped bool, err error) {
 	status := fn(r)
 
 	if !status.SkipCheckpoint {
@@ -240,7 +275,7 @@ func (c *Consumer) handleRecord(shardID string, r *Record, fn func(*Record) Scan
 	return false, nil
 }
 
-func (c *Consumer) getShardIDs(streamName string) ([]string, error) {
+func (c *Consumer) getShards(streamName string) ([]*kinesis.Shard, error) {
 	resp, err := c.client.DescribeStream(
 		&kinesis.DescribeStreamInput{
 			StreamName: aws.String(streamName),
@@ -249,12 +284,7 @@ func (c *Consumer) getShardIDs(streamName string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("describe stream error: %v", err)
 	}
-
-	var ss []string
-	for _, shard := range resp.StreamDescription.Shards {
-		ss = append(ss, *shard.ShardId)
-	}
-	return ss, nil
+	return resp.StreamDescription.Shards, nil
 }
 
 func (c *Consumer) getShardIterator(streamName, shardID, lastSeqNum string) (*string, error) {
